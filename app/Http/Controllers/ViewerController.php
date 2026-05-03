@@ -11,6 +11,8 @@ class ViewerController extends Controller
 {
     public function index(): View
     {
-        return view('viewer');
+        return view('viewer', [
+            'iceServers' => config('webrtc.ice_servers'),
+        ]);
     }
 }

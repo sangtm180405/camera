@@ -160,7 +160,7 @@
 </head>
 <body>
 <div class="stage" id="stage">
-    <video id="remoteVideo" playsinline autoplay></video>
+    <video id="remoteVideo" playsinline webkit-playsinline autoplay muted></video>
 
     <div class="offline" id="offlineScreen">
         <div class="offline-icon" aria-hidden="true"></div>
@@ -215,11 +215,8 @@
     }
 
     var rtcConfig = {
-        iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' }
-        ]
+        iceServers: @json($iceServers),
+        iceCandidatePoolSize: 10
     };
 
     var elStage = document.getElementById('stage');
@@ -465,6 +462,11 @@
                 ms.addTrack(ev.track);
                 elVideo.srcObject = ms;
             }
+            elVideo.muted = true;
+            elVideo.playsInline = true;
+            elVideo.play().catch(function (e) {
+                console.warn('[Viewer] video.play():', e);
+            });
             startFps();
             startWatch();
             setUiState('live');

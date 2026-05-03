@@ -11,6 +11,8 @@ class CameraController extends Controller
 {
     public function index(): View
     {
-        return view('camera');
+        return view('camera', [
+            'iceServers' => config('webrtc.ice_servers'),
+        ]);
     }
 }
