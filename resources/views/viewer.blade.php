@@ -195,7 +195,7 @@
     /**
      * Trang VIEWER — luồng tóm tắt:
      * 1) Poll GET /signal/status mỗi 2s → biết camera có heartbeat hay không.
-     * 2) Khi online: tạo RTCPeerConnection (không addTransceiver — SDP tự negotiate), poll GET /signal/poll?role=viewer mỗi 300ms.
+     * 2) POST /signal/join (viewer_id); khi online: RTCPeerConnection, poll /signal/poll?role=viewer&viewer_id=… mỗi 300ms.
      * 3) Nhận offer → setRemoteDescription → createAnswer → POST /signal/answer.
      * 4) ICE trickle: gửi POST /signal/ice (role=viewer), nhận ICE camera qua poll và addIceCandidate (hàng đợi nếu chưa có remote SDP).
      * 5) ontrack gán MediaStream vào <video>; đếm FPS và RTT ước lượng từ getStats.
@@ -212,6 +212,23 @@
             'Accept': 'application/json',
             'X-CSRF-TOKEN': csrfToken()
         };
+    }
+
+    /** Mỗi tab viewer một id (UUID) — nhiều người xem = nhiều id */
+    var viewerId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            var r = Math.random() * 16 | 0;
+            var v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+
+    function registerJoin() {
+        return fetch('/signal/join', {
+            method: 'POST',
+            headers: jsonHeaders(),
+            body: JSON.stringify({ viewer_id: viewerId })
+        }).catch(function () {});
     }
 
     var rtcConfig = {
@@ -234,10 +251,13 @@
     var pollSigTimer = null;
     var statusTimer = null;
     var reconnectTimer = null;
+    var disconnectGraceTimer = null;
     var uiHideTimer = null;
+    var VIEWER_DISCONNECT_GRACE_MS = 20000;
+    var lastRemoteOfferSdp = '';
 
     var cameraOnline = false;
-    var sessionId = null;
+    var lastBroadcastId = null;
     var seenIce = {};
     var pendingIce = [];
     var remoteSet = false;
@@ -329,7 +349,11 @@
         fetch('/signal/ice', {
             method: 'POST',
             headers: jsonHeaders(),
-            body: JSON.stringify({ role: role, candidate: candidate.toJSON() })
+            body: JSON.stringify({
+                role: role,
+                viewer_id: viewerId,
+                candidate: candidate.toJSON()
+            })
         }).catch(function () {});
     }
 
@@ -352,10 +376,14 @@
         stopSigPoll();
         stopWatch();
         remoteSet = false;
-        sessionId = null;
+        lastRemoteOfferSdp = '';
         seenIce = {};
         pendingIce = [];
         elLive.classList.remove('on');
+        if (disconnectGraceTimer) {
+            clearTimeout(disconnectGraceTimer);
+            disconnectGraceTimer = null;
+        }
         if (pc) {
             pc.ontrack = null;
             pc.onicecandidate = null;
@@ -443,12 +471,19 @@
         setUiState('connecting');
         elLoadText.textContent = 'Đang kết nối…';
 
+        registerJoin();
+
         pc = new RTCPeerConnection(rtcConfig);
 
         // KHÔNG dùng addTransceiver — để SDP tự negotiate
 
         pc.onicecandidate = function (ev) {
             if (ev.candidate) sendIce('viewer', ev.candidate);
+        };
+
+        pc.oniceconnectionstatechange = function () {
+            var ice = pc.iceConnectionState;
+            console.log('[Viewer] iceConnectionState:', ice);
         };
 
         pc.ontrack = function (ev) {
@@ -476,64 +511,94 @@
         pc.onconnectionstatechange = function () {
             var s = pc.connectionState;
             console.log('[Viewer] connectionState:', s);
-            if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+            if (s === 'connected') {
+                if (disconnectGraceTimer) {
+                    clearTimeout(disconnectGraceTimer);
+                    disconnectGraceTimer = null;
+                }
+                console.log('[Viewer] P2P kết nối thành công!');
+            }
+            if (s === 'failed' || s === 'closed') {
+                if (disconnectGraceTimer) {
+                    clearTimeout(disconnectGraceTimer);
+                    disconnectGraceTimer = null;
+                }
                 elLive.classList.remove('on');
                 scheduleReconnect();
             }
-            if (s === 'connected') {
-                console.log('[Viewer] P2P kết nối thành công!');
+            if (s === 'disconnected') {
+                if (disconnectGraceTimer) clearTimeout(disconnectGraceTimer);
+                disconnectGraceTimer = setTimeout(function () {
+                    disconnectGraceTimer = null;
+                    if (!pc) return;
+                    var s2 = pc.connectionState;
+                    if (s2 === 'disconnected' || s2 === 'failed') {
+                        elLive.classList.remove('on');
+                        scheduleReconnect();
+                    }
+                }, VIEWER_DISCONNECT_GRACE_MS);
             }
         };
 
         pollSigTimer = setInterval(function () {
-            fetch('/signal/poll?role=viewer')
+            fetch('/signal/poll?role=viewer&viewer_id=' + encodeURIComponent(viewerId))
                 .then(function (r) { return r.json(); })
                 .then(function (j) {
                     if (!pc) return;
 
-                    if (j.session_id && sessionId && j.session_id !== sessionId && remoteSet) {
+                    if (j.broadcast_id && lastBroadcastId && j.broadcast_id !== lastBroadcastId && remoteSet) {
                         scheduleReconnect();
                         return;
                     }
-                    if (j.session_id) {
-                        sessionId = j.session_id;
+                    if (j.broadcast_id) {
+                        lastBroadcastId = j.broadcast_id;
                     }
 
-                    if (j.offer && !remoteSet) {
-                        remoteSet = true;
-                        console.log('[Viewer] Nhận offer, setRemoteDescription...');
-
+                    if (j.offer) {
                         var rawOffer = j.offer;
-                        var offerDesc = {
-                            type: (rawOffer.type || 'offer').toLowerCase(),
-                            sdp: normalizeSdpForWebRTC(rawOffer.sdp || '')
-                        };
-
-                        pc.setRemoteDescription(new RTCSessionDescription(offerDesc))
-                            .then(function () {
-                                console.log('[Viewer] setRemoteDescription OK, tạo answer...');
-                                flushIceQueue();
-                                return pc.createAnswer();
-                            })
-                            .then(function (answer) {
-                                console.log('[Viewer] createAnswer OK');
-                                return pc.setLocalDescription(answer).then(function () { return answer; });
-                            })
-                            .then(function (answer) {
-                                console.log('[Viewer] Gửi answer lên server...');
-                                return fetch('/signal/answer', {
-                                    method: 'POST',
-                                    headers: jsonHeaders(),
-                                    body: JSON.stringify({ type: answer.type, sdp: answer.sdp })
+                        var sdpNorm = normalizeSdpForWebRTC(rawOffer.sdp || '');
+                        if (sdpNorm === lastRemoteOfferSdp) {
+                            /* offer trùng SDP — bỏ qua */
+                        } else {
+                            lastRemoteOfferSdp = sdpNorm;
+                            if (!remoteSet) remoteSet = true;
+                            console.log('[Viewer] Offer (mới / ICE restart), setRemoteDescription...');
+                            seenIce = {};
+                            pendingIce = [];
+                            var offerDesc = {
+                                type: (rawOffer.type || 'offer').toLowerCase(),
+                                sdp: sdpNorm
+                            };
+                            pc.setRemoteDescription(new RTCSessionDescription(offerDesc))
+                                .then(function () {
+                                    console.log('[Viewer] setRemoteDescription OK, tạo answer...');
+                                    flushIceQueue();
+                                    return pc.createAnswer();
+                                })
+                                .then(function (answer) {
+                                    console.log('[Viewer] createAnswer OK');
+                                    return pc.setLocalDescription(answer).then(function () { return answer; });
+                                })
+                                .then(function (answer) {
+                                    console.log('[Viewer] Gửi answer lên server...');
+                                    return fetch('/signal/answer', {
+                                        method: 'POST',
+                                        headers: jsonHeaders(),
+                                        body: JSON.stringify({
+                                            viewer_id: viewerId,
+                                            type: answer.type,
+                                            sdp: answer.sdp
+                                        })
+                                    });
+                                })
+                                .then(function (r) {
+                                    console.log('[Viewer] Answer gửi xong, status:', r.status);
+                                })
+                                .catch(function (e) {
+                                    console.error('[Viewer] Lỗi handshake:', e);
+                                    scheduleReconnect();
                                 });
-                            })
-                            .then(function (r) {
-                                console.log('[Viewer] Answer gửi xong, status:', r.status);
-                            })
-                            .catch(function (e) {
-                                console.error('[Viewer] Lỗi handshake:', e);
-                                scheduleReconnect();
-                            });
+                        }
                     }
 
                     if (j.ice && j.ice.length) {
@@ -556,8 +621,12 @@
             .then(function (r) { return r.json(); })
             .then(function (j) {
                 var on = !!(j && j.online);
+                if (on && j && j.broadcast_id) {
+                    lastBroadcastId = j.broadcast_id;
+                }
                 if (on && !cameraOnline) {
                     cameraOnline = true;
+                    registerJoin();
                     setUiState('connecting');
                     startHandshake();
                 } else if (!on && cameraOnline) {

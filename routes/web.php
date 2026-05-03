@@ -11,6 +11,7 @@ Route::get('/', function () {
 
 Route::get('/camera', [CameraController::class, 'index']);
 Route::get('/viewer', [ViewerController::class, 'index']);
+Route::post('/signal/join', [SignalingController::class, 'join']);
 Route::post('/signal/offer', [SignalingController::class, 'sendOffer']);
 Route::post('/signal/answer', [SignalingController::class, 'sendAnswer']);
 Route::post('/signal/ice', [SignalingController::class, 'sendIce']);

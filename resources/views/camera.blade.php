@@ -207,8 +207,8 @@
     /**
      * Trang CAMERA (publisher) — luồng chính:
      * 1) Tự động getUserMedia (ưu tiên camera sau → fallback trước) với ràng buộc nhẹ cho Android cũ.
-     * 2) Tạo RTCPeerConnection + addTrack, createOffer → POST /signal/offer (server reset phiên signaling cũ).
-     * 3) Poll GET /signal/poll?role=camera mỗi 300ms để nhận answer + ICE từ viewer.
+     * 2) Mỗi viewer có UUID: server hàng đợi pending_viewers; camera tạo RTCPeerConnection + offer / viewer.
+     * 3) Poll GET /signal/poll?role=camera&viewers=id1,id2 để nhận answer + ICE từng viewer.
      * 4) Gửi ICE local qua POST /signal/ice với role=camera.
      * 5) Heartbeat POST /signal/status mỗi 5s để viewer biết camera còn sống (TTL cache 10s).
      * 6) Theo dõi connectionState: failed/disconnected → reconnect sau 3s (tạo offer mới).
@@ -236,16 +236,13 @@
         el.textContent = msg;
     }
 
-    // --- Trạng thái WebRTC ---
+    // --- Trạng thái WebRTC: nhiều viewer, mỗi viewer một RTCPeerConnection ---
     var localStream = null;
-    var pc = null;
+    var broadcastId = null;
+    /** @type {Map<string, object>} viewerId -> { pc, remoteAnswerApplied, pendingRemoteIce, seenIceKeys } */
+    var peers = new Map();
     var pollTimer = null;
     var hbTimer = null;
-    var reconnectTimer = null;
-    var sessionIdSeen = null;
-    var seenIceKeys = {};
-    var pendingRemoteIce = [];
-    var remoteAnswerApplied = false;
 
     var elVideo = document.getElementById('localVideo');
     var elLoad = document.getElementById('loadingMask');
@@ -296,56 +293,47 @@
         }
     }
 
-    // --- Số viewer (P2P một kênh): 1 nếu kết nối ICE/DTLS thành công và có gửi RTP ---
     function updateViewerCountFromStats() {
-        if (!pc) {
-            elViewerMeta.textContent = 'Viewer: 0';
-            return;
-        }
-        pc.getStats(null).then(function (stats) {
-            var ok = pc.connectionState === 'connected';
-            var sending = false;
-            stats.forEach(function (r) {
-                if (r.type === 'outbound-rtp' && r.kind === 'video') {
-                    if (r.bytesSent > 0 || r.packetsSent > 0) sending = true;
-                }
-            });
-            elViewerMeta.textContent = 'Viewer: ' + ((ok && sending) ? 1 : 0);
-        }).catch(function () {
-            elViewerMeta.textContent = 'Viewer: —';
+        var n = 0;
+        peers.forEach(function (st) {
+            if (st.pc && st.pc.connectionState === 'connected') n++;
         });
+        elViewerMeta.textContent = 'Viewer: ' + n;
     }
     setInterval(updateViewerCountFromStats, 1000);
 
-    // --- Heartbeat online (TTL phía server 10s) ---
     function heartbeat() {
+        var body = { online: true };
+        if (broadcastId) body.broadcast_id = broadcastId;
         fetch('/signal/status', {
             method: 'POST',
             headers: jsonHeaders(),
-            body: JSON.stringify({ online: true })
-        }).catch(function () { /* mạng lỗi — lần sau thử lại */ });
+            body: JSON.stringify(body)
+        }).catch(function () {});
     }
 
-    // --- Gửi ICE lên server (role=camera) ---
-    function sendLocalIce(candidate) {
+    function sendLocalIce(candidate, viewerId) {
         if (!candidate || !candidate.candidate) return;
         fetch('/signal/ice', {
             method: 'POST',
             headers: jsonHeaders(),
-            body: JSON.stringify({ role: 'camera', candidate: candidate.toJSON() })
+            body: JSON.stringify({
+                role: 'camera',
+                viewer_id: viewerId,
+                candidate: candidate.toJSON()
+            })
         }).catch(function () {});
     }
 
-    function iceKey(c) {
+    function iceKeyStr(c) {
         return (c.candidate || '') + '|' + (c.sdpMid || '') + '|' + (c.sdpMLineIndex != null ? c.sdpMLineIndex : '');
     }
 
-    function flushPendingIce() {
-        if (!pc || !pc.remoteDescription) return;
-        while (pendingRemoteIce.length) {
-            var raw = pendingRemoteIce.shift();
-            var c = new RTCIceCandidate(raw);
-            pc.addIceCandidate(c).catch(function () {});
+    function flushPendingIceFor(st) {
+        if (!st.pc || !st.pc.remoteDescription) return;
+        while (st.pendingRemoteIce.length) {
+            var raw = st.pendingRemoteIce.shift();
+            st.pc.addIceCandidate(new RTCIceCandidate(raw)).catch(function () {});
         }
     }
 
@@ -356,117 +344,311 @@
         }
     }
 
-    function teardownPeer() {
+    /** Chờ connectionState disconnected trước khi gỡ peer (rung/sóng yếu hay tự hồi) */
+    var DISCONNECT_GRACE_MS = 20000;
+
+    function removePeer(viewerId) {
+        var st = peers.get(viewerId);
+        if (!st) return;
+        if (st.disconnectTimer) {
+            clearTimeout(st.disconnectTimer);
+            st.disconnectTimer = null;
+        }
+        if (st.iceDisconnectTimer) {
+            clearTimeout(st.iceDisconnectTimer);
+            st.iceDisconnectTimer = null;
+        }
+        if (st.failedRemoveTimer) {
+            clearTimeout(st.failedRemoveTimer);
+            st.failedRemoveTimer = null;
+        }
+        if (st.pc) {
+            st.pc.onicecandidate = null;
+            st.pc.oniceconnectionstatechange = null;
+            st.pc.onconnectionstatechange = null;
+            st.pc.close();
+        }
+        peers.delete(viewerId);
+    }
+
+    function teardownAllPeers() {
         stopPoll();
-        remoteAnswerApplied = false;
-        pendingRemoteIce = [];
-        seenIceKeys = {};
-        sessionIdSeen = null;
-        if (pc) {
-            pc.onicecandidate = null;
-            pc.onconnectionstatechange = null;
-            pc.close();
-            pc = null;
-        }
+        peers.forEach(function (_, vid) { removePeer(vid); });
+        peers.clear();
     }
 
-    function scheduleReconnect(reason) {
-        if (reconnectTimer) return;
-        setConnUi('Mất kết nối — thử lại sau 3s…', false);
-        elRec.classList.add('off');
-        reconnectTimer = setTimeout(function () {
-            reconnectTimer = null;
-            beginSession();
-        }, 3000);
+    function makePeerState() {
+        return {
+            pc: null,
+            remoteAnswerApplied: false,
+            pendingRemoteIce: [],
+            seenIceKeys: {},
+            disconnectTimer: null,
+            iceDisconnectTimer: null,
+            failedRemoveTimer: null,
+            lastIceRestart: 0
+        };
     }
 
-    // --- Tạo offer, đăng ký poll answer + ICE viewer ---
-    function beginSession() {
-        // Hủy reconnect chờ sẵn nếu ta chủ động tạo phiên mới (tránh gọi trùng sau khi đã hồi phục)
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = null;
+    /** Gửi lại offer (iceRestart) khi ICE failed/disconnected lâu — rung mạnh / Android hay làm ICE tụt */
+    function tryIceRestartForViewer(viewerId) {
+        var st = peers.get(viewerId);
+        if (!st || !st.pc || st.pc.signalingState === 'closed') return;
+        var now = Date.now();
+        if (st.lastIceRestart && (now - st.lastIceRestart) < 6000) return;
+        st.lastIceRestart = now;
+        console.log('[Camera] ICE restart / offer mới cho viewer', viewerId);
+
+        if (typeof st.pc.restartIce === 'function') {
+            try { st.pc.restartIce(); } catch (e) { console.warn('[Camera] restartIce', e); }
         }
-        teardownPeer();
-        if (!localStream) return;
 
-        setConnUi('Đang tạo phiên WebRTC…', true);
-        pc = new RTCPeerConnection(rtcConfig);
+        st.remoteAnswerApplied = false;
+        st.seenIceKeys = {};
+        st.pendingRemoteIce = [];
 
-        localStream.getTracks().forEach(function (t) {
-            pc.addTrack(t, localStream);
-        });
+        var p = st.pc.createOffer({ iceRestart: true });
+        p = p.catch(function () { return st.pc.createOffer(); });
 
-        pc.onicecandidate = function (ev) {
-            if (ev.candidate) sendLocalIce(ev.candidate);
-        };
-
-        pc.onconnectionstatechange = function () {
-            var s = pc.connectionState;
-            if (s === 'connected') {
-                setConnUi('P2P: đã kết nối', true);
-                elRec.classList.remove('off');
-            }
-            if (s === 'failed' || s === 'disconnected') {
-                scheduleReconnect(s);
-            }
-        };
-
-        pc.createOffer()
-            .then(function (offer) { return pc.setLocalDescription(offer).then(function () { return offer; }); })
+        p.then(function (offer) { return st.pc.setLocalDescription(offer).then(function () { return offer; }); })
             .then(function (offer) {
-                console.log('[Camera] Đang gửi offer lên server...');
                 return fetch('/signal/offer', {
                     method: 'POST',
                     headers: jsonHeaders(),
-                    body: JSON.stringify({ type: offer.type, sdp: offer.sdp })
+                    body: JSON.stringify({ viewer_id: viewerId, type: offer.type, sdp: offer.sdp })
                 });
             })
-            .then(function (r) {
-                console.log('[Offer] HTTP status:', r.status);
-                return r.json();
-            })
+            .then(function (r) { return r.json(); })
             .then(function (data) {
-                console.log('[Offer] Server trả về:', JSON.stringify(data));
-                if (!data.ok) throw new Error('Offer bị từ chối');
-                sessionIdSeen = data.session_id || null;
-                setConnUi('Đã gửi offer — chờ viewer…', true);
-
-                pollTimer = setInterval(function () {
-                    fetch('/signal/poll?role=camera')
-                        .then(function (r) { return r.json(); })
-                        .then(function (j) {
-                            if (!pc) return;
-                            if (j.session_id && sessionIdSeen && j.session_id !== sessionIdSeen) {
-                                // Phiên signaling đổi — bắt đầu lại
-                                scheduleReconnect('session');
-                                return;
-                            }
-                            if (j.answer && !remoteAnswerApplied) {
-                                remoteAnswerApplied = true;
-                                pc.setRemoteDescription(new RTCSessionDescription(j.answer))
-                                    .then(flushPendingIce)
-                                    .catch(function (e) {
-                                        showErr('Không áp dụng được answer: ' + (e && e.message));
-                                    });
-                            }
-                            if (j.ice && j.ice.length) {
-                                j.ice.forEach(function (raw) {
-                                    var k = iceKey(raw);
-                                    if (seenIceKeys[k]) return;
-                                    seenIceKeys[k] = true;
-                                    if (!pc.remoteDescription) pendingRemoteIce.push(raw);
-                                    else pc.addIceCandidate(new RTCIceCandidate(raw)).catch(function () {});
-                                });
-                            }
-                        })
-                        .catch(function () {});
-                }, 300);
+                if (!data.ok) throw new Error('offer');
             })
             .catch(function (e) {
-                showErr('Lỗi tạo offer / mạng: ' + (e && e.message));
-                setConnUi('Lỗi', false);
+                console.warn('[Camera] ICE restart thất bại', viewerId, e);
             });
+    }
+
+    function attachTrackEndedHandler(stream) {
+        stream.getVideoTracks().forEach(function (track) {
+            track.onended = function () {
+                console.warn('[Camera] Track video kết thúc (rung/OS) — mở lại camera…');
+                reopenCameraTracks();
+            };
+        });
+    }
+
+    function reopenCameraTracks() {
+        if (!localStream) return;
+        tryGetUserMedia('environment')
+            .catch(function () { return tryGetUserMedia('user'); })
+            .then(function (stream) {
+                localStream.getTracks().forEach(function (t) { t.stop(); });
+                localStream = stream;
+                elVideo.srcObject = stream;
+                attachTrackEndedHandler(stream);
+                peers.forEach(function (st) {
+                    if (!st.pc) return;
+                    var vt = stream.getVideoTracks()[0];
+                    if (!vt) return;
+                    st.pc.getSenders().forEach(function (sender) {
+                        if (sender.track && sender.track.kind === 'video') {
+                            sender.replaceTrack(vt).catch(function () {});
+                        }
+                    });
+                });
+            })
+            .catch(function (e) {
+                console.error('[Camera] Không mở lại camera:', e);
+                showErr('Camera ngắt sau rung — mở lại quyền camera.');
+            });
+    }
+
+    function createPeerForViewer(viewerId) {
+        if (!localStream || peers.has(viewerId)) return;
+        var st = makePeerState();
+        st.pc = new RTCPeerConnection(rtcConfig);
+        peers.set(viewerId, st);
+
+        localStream.getTracks().forEach(function (t) {
+            st.pc.addTrack(t, localStream);
+        });
+
+        st.pc.onicecandidate = function (ev) {
+            if (ev.candidate) sendLocalIce(ev.candidate, viewerId);
+        };
+
+        st.pc.oniceconnectionstatechange = function () {
+            var ice = st.pc.iceConnectionState;
+            if (ice === 'connected' || ice === 'completed') {
+                if (st.iceDisconnectTimer) {
+                    clearTimeout(st.iceDisconnectTimer);
+                    st.iceDisconnectTimer = null;
+                }
+            }
+            if (ice === 'failed') {
+                tryIceRestartForViewer(viewerId);
+            }
+            if (ice === 'disconnected') {
+                if (st.iceDisconnectTimer) clearTimeout(st.iceDisconnectTimer);
+                st.iceDisconnectTimer = setTimeout(function () {
+                    st.iceDisconnectTimer = null;
+                    if (!peers.has(viewerId)) return;
+                    var st2 = peers.get(viewerId);
+                    if (!st2 || !st2.pc) return;
+                    var i2 = st2.pc.iceConnectionState;
+                    if (i2 === 'disconnected' || i2 === 'failed') {
+                        tryIceRestartForViewer(viewerId);
+                    }
+                }, 4000);
+            }
+        };
+
+        st.pc.onconnectionstatechange = function () {
+            var s = st.pc.connectionState;
+            if (s === 'connected') {
+                if (st.disconnectTimer) {
+                    clearTimeout(st.disconnectTimer);
+                    st.disconnectTimer = null;
+                }
+                if (st.failedRemoveTimer) {
+                    clearTimeout(st.failedRemoveTimer);
+                    st.failedRemoveTimer = null;
+                }
+                setConnUi('P2P: ' + peers.size + ' viewer', true);
+                elRec.classList.remove('off');
+            }
+            if (s === 'failed') {
+                if (st.disconnectTimer) {
+                    clearTimeout(st.disconnectTimer);
+                    st.disconnectTimer = null;
+                }
+                tryIceRestartForViewer(viewerId);
+                if (st.failedRemoveTimer) clearTimeout(st.failedRemoveTimer);
+                st.failedRemoveTimer = setTimeout(function () {
+                    st.failedRemoveTimer = null;
+                    if (!peers.has(viewerId)) return;
+                    var st3 = peers.get(viewerId);
+                    if (!st3 || !st3.pc) return;
+                    if (st3.pc.connectionState === 'failed' || st3.pc.connectionState === 'closed') {
+                        removePeer(viewerId);
+                        if (peers.size === 0) elRec.classList.add('off');
+                        updateViewerCountFromStats();
+                    }
+                }, 8000);
+            }
+            if (s === 'closed') {
+                if (st.disconnectTimer) {
+                    clearTimeout(st.disconnectTimer);
+                    st.disconnectTimer = null;
+                }
+                if (st.failedRemoveTimer) {
+                    clearTimeout(st.failedRemoveTimer);
+                    st.failedRemoveTimer = null;
+                }
+                removePeer(viewerId);
+                if (peers.size === 0) elRec.classList.add('off');
+                updateViewerCountFromStats();
+            }
+            if (s === 'disconnected') {
+                if (st.disconnectTimer) clearTimeout(st.disconnectTimer);
+                st.disconnectTimer = setTimeout(function () {
+                    st.disconnectTimer = null;
+                    if (!peers.has(viewerId)) return;
+                    var st2 = peers.get(viewerId);
+                    if (!st2 || !st2.pc) return;
+                    var s2 = st2.pc.connectionState;
+                    if (s2 === 'disconnected' || s2 === 'failed') {
+                        removePeer(viewerId);
+                        if (peers.size === 0) elRec.classList.add('off');
+                        updateViewerCountFromStats();
+                    }
+                }, DISCONNECT_GRACE_MS);
+            }
+        };
+
+        st.pc.createOffer()
+            .then(function (offer) { return st.pc.setLocalDescription(offer).then(function () { return offer; }); })
+            .then(function (offer) {
+                console.log('[Camera] Gửi offer cho viewer', viewerId);
+                return fetch('/signal/offer', {
+                    method: 'POST',
+                    headers: jsonHeaders(),
+                    body: JSON.stringify({ viewer_id: viewerId, type: offer.type, sdp: offer.sdp })
+                });
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (!data.ok) throw new Error('Offer bị từ chối');
+                console.log('[Offer] OK', viewerId, data);
+            })
+            .catch(function (e) {
+                console.error('[Camera] Lỗi offer', viewerId, e);
+                removePeer(viewerId);
+                showErr('Lỗi offer viewer ' + viewerId.slice(0, 8) + '…');
+            });
+    }
+
+    function pollCamera() {
+        if (!localStream) return;
+        var ids = Array.from(peers.keys());
+        var qs = ids.length ? ('?role=camera&viewers=' + encodeURIComponent(ids.join(','))) : '?role=camera&viewers=';
+        fetch('/signal/poll' + qs)
+            .then(function (r) { return r.json(); })
+            .then(function (j) {
+                (j.pending_viewers || []).forEach(function (vid) {
+                    var st = peers.get(vid);
+                    if (st && st.pc) {
+                        var cs = st.pc.connectionState;
+                        if (cs === 'failed' || cs === 'closed') {
+                            removePeer(vid);
+                        }
+                    }
+                    if (!peers.has(vid)) createPeerForViewer(vid);
+                });
+                var answers = j.answers || {};
+                Object.keys(answers).forEach(function (vid) {
+                    var ans = answers[vid];
+                    var st = peers.get(vid);
+                    if (!st || !ans) return;
+                    if (st.remoteAnswerApplied) return;
+                    st.remoteAnswerApplied = true;
+                    st.pc.setRemoteDescription(new RTCSessionDescription(ans))
+                        .then(function () { flushPendingIceFor(st); })
+                        .catch(function (e) {
+                            showErr('Answer: ' + (e && e.message));
+                        });
+                });
+                var iceMap = j.ice_viewer || {};
+                Object.keys(iceMap).forEach(function (vid) {
+                    var st = peers.get(vid);
+                    if (!st) return;
+                    (iceMap[vid] || []).forEach(function (raw) {
+                        var k = iceKeyStr(raw);
+                        if (st.seenIceKeys[k]) return;
+                        st.seenIceKeys[k] = true;
+                        if (!st.pc.remoteDescription) st.pendingRemoteIce.push(raw);
+                        else st.pc.addIceCandidate(new RTCIceCandidate(raw)).catch(function () {});
+                    });
+                });
+            })
+            .catch(function () {});
+    }
+
+    /** Bắt đầu phát đa viewer: broadcast_id mới, poll hàng đợi + ICE/answer theo từng viewer_id */
+    function beginSession() {
+        teardownAllPeers();
+        if (!localStream) return;
+        broadcastId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+                var r = Math.random() * 16 | 0;
+                var v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        setConnUi('Đang chờ viewer…', true);
+        elRec.classList.add('off');
+        heartbeat();
+        pollTimer = setInterval(pollCamera, 300);
+        pollCamera();
     }
 
     // --- Xin quyền camera: ưu tiên sau (environment), fallback trước ---
@@ -494,6 +676,7 @@
             elVideo.srcObject = stream;
             elLoad.classList.add('hidden');
             startFpsMeter();
+            attachTrackEndedHandler(stream);
             console.log('[Camera] Bắt đầu beginSession...');
             beginSession();
             heartbeat();
